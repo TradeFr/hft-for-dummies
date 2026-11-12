@@ -199,6 +199,22 @@ impl Bullet {
         parse_user_trades(&body)
     }
 
+    /// The account's equity according to the exchange: wallet balance plus
+    /// the open profit or loss of every position, in USD.
+    pub async fn equity(&self) -> Result<Decimal> {
+        let account = self
+            .account
+            .as_deref()
+            .ok_or_else(|| anyhow!("no account in dry run"))?;
+        let info = self
+            .client
+            .account_info(account)
+            .await
+            .context("reading the account's equity")?
+            .into_inner();
+        Ok(info.total_margin_balance)
+    }
+
     /// Our position according to the exchange (positive = long).
     pub async fn position(&self) -> Result<Decimal> {
         let account = self

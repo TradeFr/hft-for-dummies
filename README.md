@@ -89,9 +89,14 @@ run the bot"*; `AGENTS.md` has its instructions.
    the price, marked ▸ in the app's order book (set its
    granularity to 0.1 or finer). Ctrl-C cancels them.
 
-Limits in `bot.toml`: at most 0.1 SOL held, stops after a $2 loss. Stopping
-doesn't close your position, and the bot cancels any SOL-USD orders you
-place by hand on the same account.
+Limits in `bot.toml`: at most 0.1 SOL held, stops after a $2 loss. That loss
+limit resets when the bot restarts, so for live trading also set
+`min_equity_usd` (e.g. `"18"` on a $20 account): every 30 s the bot reads the
+account's equity from Bullet and stops for good below it, whatever happened
+before a restart or a crash. Orders expire after `quote_ttl_secs` (10 s), which
+is all that protects them if the bot's own connection dies. Stopping doesn't
+close your position, and the bot cancels any SOL-USD orders you place by hand
+on the same account.
 
 ## The code
 

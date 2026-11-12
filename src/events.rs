@@ -43,6 +43,9 @@ pub enum Event {
     BookLost,
     /// One of our orders (partly) filled.
     Fill(Fill),
+    /// The account's equity (balance plus open profit or loss) according to
+    /// the exchange, in USD.
+    Equity(Decimal),
     /// One of our orders left the book without filling (cancelled or rejected).
     OrderGone { client_id: u64 },
     /// The exchange confirmed one of our orders is resting on the book.
@@ -147,6 +150,10 @@ pub enum Intent {
     /// [`Event::Fill`]s; ones we already have are ignored). The websocket can
     /// miss a fill; the exchange's own record can't.
     SyncFills,
+    /// Ask the exchange for the account's equity (comes back as
+    /// [`Event::Equity`]). The exchange keeps the score across restarts, so
+    /// this is the loss limit that a crash or a restart can't reset.
+    SyncEquity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

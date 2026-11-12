@@ -44,6 +44,11 @@ pub struct Config {
 
     /// Stop quoting for the rest of the run once we are down this much (USD, fees included).
     pub max_loss_usd: Decimal,
+    /// Live only: stop for good if the account's equity (read from the
+    /// exchange) falls below this, in USD. Unlike `max_loss_usd` it survives
+    /// restarts and crashes: the exchange keeps the score, not the bot.
+    #[serde(default)]
+    pub min_equity_usd: Option<Decimal>,
     /// Pull quotes if Binance goes quiet for this long.
     pub reference_stale_secs: u64,
     /// Pull quotes if the Bullet book goes quiet for this long.
@@ -94,6 +99,18 @@ impl Config {
                 bail!("{name} must be greater than 0, got {value}");
             }
         }
+        if let Some(floor) = self.min_equity_usd
+            && floor <= Decimal::ZERO
+        {
+            bail!("min_equity_usd must be greater than 0, got {floor}");
+        }
+        // Quotes are refreshed at half their lifetime, in whole seconds.
+        if self.quote_ttl_secs < 2 {
+            bail!(
+                "quote_ttl_secs must be at least 2, got {}",
+                self.quote_ttl_secs
+            );
+        }
         if self.skew_bps < Decimal::ZERO {
             bail!("skew_bps can't be negative, got {}", self.skew_bps);
         }
@@ -116,6 +133,30 @@ mod tests {
     fn the_shipped_bot_toml_is_valid_and_safe() {
         let config = Config::load(Path::new("bot.toml")).unwrap();
         assert!(config.dry_run, "a fresh clone must never trade real money");
+    }
+
+    #[test]
+    fn quotes_expire_quickly_enough_to_limit_a_dead_connection() {
+        // If our own connection dies, we can't cancel: the expiry is all that
+        // protects us. The chaos test showed 30 s is a long time to be blind.
+        let config = Config::load(Path::new("bot.toml")).unwrap();
+        assert!(config.quote_ttl_secs <= 10);
+    }
+
+    #[test]
+    fn rejects_an_expiry_too_short_to_refresh() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        config.quote_ttl_secs = 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_non_positive_equity_floor() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        config.min_equity_usd = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.min_equity_usd = Some(Decimal::from(18));
+        assert!(config.validate().is_ok());
     }
 
     #[test]

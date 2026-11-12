@@ -106,6 +106,12 @@ impl Worker {
                     }
                     Err(e) => tracing::error!("reading our position failed: {e}"),
                 },
+                Intent::SyncEquity => match self.bullet.equity().await {
+                    Ok(equity) => self.send(Event::Equity(equity)),
+                    Err(e) => {
+                        tracing::warn!("reading the account's equity failed (will retry): {e}")
+                    }
+                },
                 Intent::SyncFills => {
                     let Some(since) = self.fills_since_us else {
                         continue;
@@ -212,7 +218,7 @@ impl Executor for PaperExecutor {
                 Intent::Cancel { client_id } => self.resting.retain(|o| o.client_id != client_id),
                 Intent::CancelAll => self.resting.clear(),
                 // Paper trading starts flat and only changes by paper fills.
-                Intent::SyncPosition | Intent::SyncFills => {}
+                Intent::SyncPosition | Intent::SyncFills | Intent::SyncEquity => {}
             }
         }
     }

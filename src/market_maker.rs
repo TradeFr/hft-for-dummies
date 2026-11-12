@@ -23,6 +23,9 @@ use crate::strategy::{self, Quotes};
 /// How often to check our fills against the exchange's record.
 const FILL_CHECK_EVERY: Duration = Duration::from_secs(10);
 
+/// How often to read the account's equity from the exchange (live only).
+const EQUITY_CHECK_EVERY: Duration = Duration::from_secs(30);
+
 /// How often to log the markout averages (when there are fills to report).
 const MARKOUT_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 
@@ -45,6 +48,7 @@ pub struct MarketMaker {
     last_requote: Option<Instant>,
     last_summary: Option<Instant>,
     last_fill_check: Option<Instant>,
+    last_equity_check: Option<Instant>,
     /// Set when something means we must not quote again this run, and why.
     stopped: Option<&'static str>,
     /// Why we are (or aren't) quoting; logged when it changes.
@@ -73,6 +77,7 @@ impl MarketMaker {
             last_requote: None,
             last_summary: None,
             last_fill_check: None,
+            last_equity_check: None,
             stopped: None,
             status: "",
         }
@@ -118,6 +123,20 @@ impl MarketMaker {
             }
             Event::BookLost => self.book = None,
             Event::Fill(fill) => self.on_fill(fill, now),
+            Event::Equity(equity) => {
+                // The exchange keeps the score, so a restart can't reset this
+                // limit. Once hit, stay stopped: a human should look first.
+                if let Some(floor) = self.config.min_equity_usd
+                    && *equity < floor
+                    && self.stopped.is_none()
+                {
+                    tracing::error!(
+                        "account equity ${equity} is below min_equity_usd (${floor}): stopping for good"
+                    );
+                    self.stopped = Some("stopped: account equity below min_equity_usd");
+                    return self.pull();
+                }
+            }
             Event::OrderGone { client_id } => self.forget(*client_id),
             Event::PlaceFailed { client_ids } => client_ids.iter().for_each(|id| self.forget(*id)),
             Event::CancelFailed => {
@@ -168,13 +187,22 @@ impl MarketMaker {
                     tracing::info!("markouts: {summary}");
                     self.last_markout_summary = Some(now);
                 }
+                let mut intents = Vec::new();
                 if self
                     .last_fill_check
                     .is_none_or(|t| now.duration_since(t) >= FILL_CHECK_EVERY)
                 {
                     self.last_fill_check = Some(now);
-                    return vec![Intent::SyncFills];
+                    intents.push(Intent::SyncFills);
                 }
+                if self
+                    .last_equity_check
+                    .is_none_or(|t| now.duration_since(t) >= EQUITY_CHECK_EVERY)
+                {
+                    self.last_equity_check = Some(now);
+                    intents.push(Intent::SyncEquity);
+                }
+                return intents;
             }
             Event::Disconnected(_)
             | Event::Shutdown
@@ -431,6 +459,50 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn stops_for_good_when_the_account_falls_below_the_equity_floor() {
+        let (mut mm, now) = warmed_up();
+        mm.config.min_equity_usd = Some(d("18"));
+        mm.requote(now);
+        assert_eq!(
+            mm.on_event(&Event::Equity(d("17.99")), now),
+            vec![Intent::CancelAll]
+        );
+        assert!(mm.requote(now).is_empty(), "no more quoting");
+        mm.on_event(&Event::Equity(d("25")), now);
+        assert!(
+            mm.requote(now + Duration::from_secs(60)).is_empty(),
+            "even if the equity comes back: a human must look first"
+        );
+    }
+
+    #[test]
+    fn equity_above_the_floor_changes_nothing() {
+        let (mut mm, now) = warmed_up();
+        mm.config.min_equity_usd = Some(d("18"));
+        assert!(mm.on_event(&Event::Equity(d("19.5")), now).is_empty());
+        assert!(!mm.requote(now).is_empty(), "still quotes");
+    }
+
+    #[test]
+    fn without_a_floor_the_equity_is_not_checked() {
+        let (mut mm, now) = warmed_up();
+        mm.config.min_equity_usd = None;
+        assert!(mm.on_event(&Event::Equity(d("1")), now).is_empty());
+        assert!(!mm.requote(now).is_empty());
+    }
+
+    #[test]
+    fn reads_the_account_equity_regularly() {
+        let (mut mm, now) = warmed_up();
+        let first = mm.on_event(&Event::Tick, now);
+        assert!(first.contains(&Intent::SyncEquity), "checks at once");
+        let soon = mm.on_event(&Event::Tick, now + Duration::from_secs(5));
+        assert!(!soon.contains(&Intent::SyncEquity), "not on every tick");
+        let later = mm.on_event(&Event::Tick, now + EQUITY_CHECK_EVERY);
+        assert!(later.contains(&Intent::SyncEquity), "and again later");
     }
 
     #[test]
@@ -705,15 +777,14 @@ mod tests {
     #[test]
     fn checks_fills_against_the_exchange_every_ten_seconds() {
         let (mut mm, now) = warmed_up();
-        assert_eq!(mm.on_event(&Event::Tick, now), vec![Intent::SyncFills]);
-        assert!(
+        let syncs_fills = |intents: Vec<Intent>| intents.contains(&Intent::SyncFills);
+        assert!(syncs_fills(mm.on_event(&Event::Tick, now)));
+        assert!(!syncs_fills(
             mm.on_event(&Event::Tick, now + Duration::from_secs(5))
-                .is_empty()
-        );
-        assert_eq!(
-            mm.on_event(&Event::Tick, now + FILL_CHECK_EVERY),
-            vec![Intent::SyncFills]
-        );
+        ));
+        assert!(syncs_fills(
+            mm.on_event(&Event::Tick, now + FILL_CHECK_EVERY)
+        ));
     }
 
     #[test]
