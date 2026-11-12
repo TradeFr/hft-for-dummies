@@ -17,10 +17,14 @@ use crate::config::Config;
 use crate::events::{Event, Fill, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
 use crate::inventory::Inventory;
+use crate::markouts::Markouts;
 use crate::strategy::{self, Quotes};
 
 /// How often to check our fills against the exchange's record.
 const FILL_CHECK_EVERY: Duration = Duration::from_secs(10);
+
+/// How often to log the markout averages (when there are fills to report).
+const MARKOUT_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 
 pub struct MarketMaker {
     config: Config,
@@ -34,6 +38,9 @@ pub struct MarketMaker {
     bid_since: Option<Instant>,
     ask_since: Option<Instant>,
     inventory: Inventory,
+    /// Was each fill a good trade? See `markouts.rs`.
+    markouts: Markouts,
+    last_markout_summary: Option<Instant>,
     next_client_id: u64,
     last_requote: Option<Instant>,
     last_summary: Option<Instant>,
@@ -60,6 +67,8 @@ impl MarketMaker {
             bid_since: None,
             ask_since: None,
             inventory: Inventory::default(),
+            markouts: Markouts::default(),
+            last_markout_summary: None,
             next_client_id,
             last_requote: None,
             last_summary: None,
@@ -87,7 +96,13 @@ impl MarketMaker {
     pub fn on_event(&mut self, event: &Event, now: Instant) -> Vec<Intent> {
         match event {
             Event::Reference { bid, ask, stamp } => {
-                self.fair.on_binance(*bid, *ask, stamp.received_at)
+                self.fair.on_binance(*bid, *ask, stamp.received_at);
+                // Every new fair value scores the fills we are still watching.
+                if let Ok(fair) = self.fair.get(now, self.reference_stale()) {
+                    for report in self.markouts.on_fair(fair, now) {
+                        tracing::info!("MARKOUT: {report}");
+                    }
+                }
             }
             Event::Book(book, _) => {
                 if let Some(mid) = book.mid() {
@@ -102,7 +117,7 @@ impl MarketMaker {
                 self.book = Some((book.clone(), now));
             }
             Event::BookLost => self.book = None,
-            Event::Fill(fill) => self.on_fill(fill),
+            Event::Fill(fill) => self.on_fill(fill, now),
             Event::OrderGone { client_id } => self.forget(*client_id),
             Event::PlaceFailed { client_ids } => client_ids.iter().for_each(|id| self.forget(*id)),
             Event::CancelFailed => {
@@ -144,6 +159,14 @@ impl MarketMaker {
                 {
                     self.log_summary();
                     self.last_summary = Some(now);
+                }
+                if self
+                    .last_markout_summary
+                    .is_none_or(|t| now.duration_since(t) >= MARKOUT_SUMMARY_EVERY)
+                    && let Some(summary) = self.markouts.summary()
+                {
+                    tracing::info!("markouts: {summary}");
+                    self.last_markout_summary = Some(now);
                 }
                 if self
                     .last_fill_check
@@ -250,10 +273,14 @@ impl MarketMaker {
         }
     }
 
-    fn on_fill(&mut self, fill: &Fill) {
+    fn on_fill(&mut self, fill: &Fill, now: Instant) {
         if !self.inventory.on_fill(fill) {
             return;
         }
+        // Remember the fair value at this moment, to judge the fill later.
+        let fair = self.fair.get(now, self.reference_stale()).ok();
+        self.markouts
+            .on_fill(fill.side, fill.price, fill.size, fair, now);
         if fill.order_finished
             && let Some(id) = fill.client_id
         {
@@ -404,6 +431,61 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn measures_the_markout_of_each_fill() {
+        let (mut mm, now) = warmed_up();
+        mm.requote(now);
+        // Fair is 100: buying at 99.90 captures about +10 bps.
+        mm.on_event(
+            &Event::Fill(Fill {
+                trade_id: 1,
+                client_id: None,
+                side: Side::Buy,
+                price: d("99.90"),
+                size: d("1"),
+                fee: Decimal::ZERO,
+                order_finished: false,
+            }),
+            now,
+        );
+        // Then Binance moves up to 100.20 and stays there for a minute.
+        for tenth in 1..=600 {
+            let t = now + Duration::from_millis(100 * tenth);
+            mm.on_event(
+                &Event::Reference {
+                    bid: d("100.1"),
+                    ask: d("100.3"),
+                    stamp: Stamp::at(t),
+                },
+                t,
+            );
+        }
+        let s = mm.markouts.summary().expect("one fill measured");
+        assert_eq!(s.fills, 1);
+        assert_eq!(s.captured_bps.round_dp(2), d("10.01"));
+        // Bought at 99.90, now worth 100.20: +30 bps at every horizon.
+        for markout in s.markout_bps {
+            assert_eq!(markout.map(|m| m.round_dp(2)), Some(d("30.03")));
+        }
+    }
+
+    #[test]
+    fn a_fill_counted_twice_is_measured_once() {
+        let (mut mm, now) = warmed_up();
+        let fill = Fill {
+            trade_id: 7,
+            client_id: None,
+            side: Side::Sell,
+            price: d("100.10"),
+            size: d("1"),
+            fee: Decimal::ZERO,
+            order_finished: false,
+        };
+        mm.on_event(&Event::Fill(fill.clone()), now);
+        mm.on_event(&Event::Fill(fill), now);
+        assert_eq!(mm.markouts.summary().unwrap().fills, 1);
     }
 
     #[test]

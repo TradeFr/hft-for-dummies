@@ -14,6 +14,7 @@ mod fair_value;
 mod inventory;
 mod key;
 mod market_maker;
+mod markouts;
 mod strategy;
 mod telemetry;
 

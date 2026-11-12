@@ -60,6 +60,19 @@ paper: place side=Sell price=100.758 size=0.05
 bullet mid 100.656 | fair 100.6573 | our bid 100.556 ask 100.758 | position 0 | pnl $0 (fees $0)
 ```
 
+Each fill is then judged against the fair value 1 s, 5 s, 30 s and 60 s later
+(its *markout*), and every minute the averages are logged:
+
+```text
+MARKOUT: Buy 0.05 @ 100.556 | captured +10.03 | 1s +4.10 | 5s -2.35 | 30s -0.80 | 60s +1.20 bps
+markouts: 12 fills (0 unscored) | captured +6.21 bps ($0.0031) | markout 1s +2.04 | 5s -1.10 | 30s -0.42 | 60s +0.30 bps ($0.0002) | adverse selection at 5s -7.31 bps
+```
+
+A positive markout means the price moved our way after the fill; adverse
+selection (markout minus spread captured) is what better-informed traders
+took back. In a dry run, fills are a best case (no queue), so treat these
+numbers as an upper bound.
+
 Settings are in `bot.toml`. Using a coding agent? Ask it to *"set me up and
 run the bot"*; `AGENTS.md` has its instructions.
 
