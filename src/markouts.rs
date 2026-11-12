@@ -51,6 +51,7 @@ struct Watched {
     price: Decimal,
     size: Decimal,
     captured_bps: Decimal,
+    captured_usd: Decimal,
     slots: [Slot; 4],
 }
 
@@ -90,6 +91,8 @@ pub struct Markouts {
     watching: VecDeque<Watched>,
     captured: Total,
     markouts: [Total; 4],
+    /// Markout minus spread captured, per horizon, over the same fills.
+    adverse: [Total; 4],
     /// Fills we couldn't measure: there was no fair value when they happened.
     unscored: u64,
 }
@@ -109,14 +112,15 @@ impl Markouts {
             return;
         };
         let captured_bps = edge_bps(side, price, fair);
-        self.captured
-            .add(captured_bps, edge_usd(side, price, size, fair));
+        let captured_usd = edge_usd(side, price, size, fair);
+        self.captured.add(captured_bps, captured_usd);
         self.watching.push_back(Watched {
             at: now,
             side,
             price,
             size,
             captured_bps,
+            captured_usd,
             slots: [Slot::Waiting; 4],
         });
     }
@@ -141,6 +145,9 @@ impl Markouts {
                 let usd = edge_usd(watched.side, watched.price, watched.size, fair);
                 watched.slots[i] = Slot::Scored(bps);
                 self.markouts[i].add(bps, usd);
+                // Compare with what this same fill captured, so recent fills
+                // that are not measured yet don't skew the average.
+                self.adverse[i].add(bps - watched.captured_bps, usd - watched.captured_usd);
             }
         }
 
@@ -169,16 +176,15 @@ impl Markouts {
     pub fn summary(&self) -> Option<Summary> {
         let captured_bps = self.captured.mean_bps()?;
         let markout_bps = self.markouts.map(|t| t.mean_bps());
-        // Adverse selection at 5 s: the markout minus what we captured.
-        let adverse_5s_bps = markout_bps[1].map(|m| m - captured_bps);
         Some(Summary {
             fills: self.captured.count,
+            measured_60s: self.markouts[3].count,
             unscored: self.unscored,
             captured_bps,
             captured_usd: self.captured.sum_usd,
             markout_bps,
             markout_60s_usd: self.markouts[3].sum_usd,
-            adverse_5s_bps,
+            adverse_5s_bps: self.adverse[1].mean_bps(),
         })
     }
 }
@@ -187,6 +193,9 @@ impl Markouts {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Summary {
     pub fills: u64,
+    /// Fills measured at 60 s: the markout averages cover fewer fills while
+    /// recent ones are still being watched.
+    pub measured_60s: u64,
     pub unscored: u64,
     pub captured_bps: Decimal,
     pub captured_usd: Decimal,
@@ -252,9 +261,10 @@ impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} fills ({} unscored) | captured {} bps (${}) | markout 1s {} | 5s {} | 30s {} | 60s {} bps (${}) | adverse selection at 5s {} bps",
+            "{} fills ({} unscored, {} measured at 60s) | captured {} bps (${}) | markout 1s {} | 5s {} | 30s {} | 60s {} bps (${}) | adverse selection at 5s {} bps",
             self.fills,
             self.unscored,
+            self.measured_60s,
             bps(Some(self.captured_bps)),
             self.captured_usd.round_dp(4),
             bps(self.markout_bps[0]),
@@ -355,6 +365,29 @@ mod tests {
         assert!(
             m.on_fair(d("100.3"), secs(start, 61.0)).is_empty(),
             "reported once"
+        );
+    }
+
+    #[test]
+    fn a_fill_still_being_watched_does_not_skew_adverse_selection() {
+        let mut m = Markouts::default();
+        let start = Instant::now();
+        // First fill: captured 0, worth +10 bps after 5 s.
+        m.on_fill(Side::Buy, d("100"), d("1"), Some(d("100")), start);
+        feed(&mut m, start, 0.1, 5.0, "100.1");
+        // A second fill that captured +50 bps, not measured yet.
+        m.on_fill(
+            Side::Buy,
+            d("100"),
+            d("1"),
+            Some(d("100.5")),
+            secs(start, 5.0),
+        );
+        let s = m.summary().unwrap();
+        assert_eq!(
+            s.adverse_5s_bps,
+            Some(d("10")),
+            "only the measured fill counts"
         );
     }
 
